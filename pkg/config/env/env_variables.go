@@ -15,6 +15,12 @@ const (
 	DaprPort string = "DAPR_PORT"
 	// AppPort is the port of the application, http/grpc depending on mode.
 	AppPort string = "APP_PORT"
-	// AppID is the ID of the application
+	// AppID is the ID of the application.
 	AppID string = "APP_ID"
+	// OpenTelemetry target URL for OTLP exporter
+	OtlpExporterEndpoint string = "OTEL_EXPORTER_OTLP_ENDPOINT"
+	// OpenTelemetry disables client transport security
+	OtlpExporterInsecure string = "OTEL_EXPORTER_OTLP_INSECURE"
+	// OpenTelemetry transport protocol (grpc, http/protobuf, http/json)
+	OtlpExporterProtocol string = "OTEL_EXPORTER_OTLP_PROTOCOL"
 )
