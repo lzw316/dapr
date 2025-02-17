@@ -1,4 +1,4 @@
-  
+
 # Dapr $dapr_version
 
 We're happy to announce the release of Dapr $dapr_version!
@@ -99,7 +99,9 @@ All done!
 
 *Note: Make sure your deployments are restarted to pick the latest version of the Dapr sidecar*
 
-#### Starting a fresh install on a cluster 
+#### Starting a fresh install on a cluster
+
+Please see [how to deploy Dapr on a Kubernetes cluster](https://docs.dapr.io/operations/hosting/kubernetes/kubernetes-deploy/) for a complete guide to installing Dapr on Kubernetes
 
 You can use Helm 3 to install Dapr:
 ```
@@ -124,7 +126,6 @@ Verify the control plane pods are running and are healthy:
 ```
 $ dapr status -k
   NAME                   NAMESPACE    HEALTHY  STATUS   REPLICAS  VERSION  AGE  CREATED
-  dapr-dashboard         dapr-system  True     Running  1         $dapr_dashboard_version    15s  $today 13:07.39
   dapr-sidecar-injector  dapr-system  True     Running  1         $dapr_version   15s  $today 13:07.39
   dapr-sentry            dapr-system  True     Running  1         $dapr_version   15s  $today 13:07.39
   dapr-operator          dapr-system  True     Running  1         $dapr_version   15s  $today 13:07.39
@@ -141,3 +142,7 @@ kubectl rollout restart deploy/<deployment-name>
 ## Breaking Changes
 
 $dapr_breaking_changes
+
+## Deprecation Notices
+
+$dapr_deprecation_notices
