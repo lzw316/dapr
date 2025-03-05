@@ -1,100 +1,209 @@
+/*
+Copyright 2023 The Dapr Authors
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package sentry
 
 import (
 	"context"
+	"crypto"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"strings"
+	"sync/atomic"
 
-	"github.com/dapr/dapr/pkg/sentry/ca"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+
+	"github.com/dapr/dapr/pkg/healthz"
+	sentryv1pb "github.com/dapr/dapr/pkg/proto/sentry/v1"
+	"github.com/dapr/dapr/pkg/security"
 	"github.com/dapr/dapr/pkg/sentry/config"
-	"github.com/dapr/dapr/pkg/sentry/identity"
-	"github.com/dapr/dapr/pkg/sentry/identity/kubernetes"
-	"github.com/dapr/dapr/pkg/sentry/identity/selfhosted"
-	k8s "github.com/dapr/dapr/pkg/sentry/kubernetes"
 	"github.com/dapr/dapr/pkg/sentry/monitoring"
 	"github.com/dapr/dapr/pkg/sentry/server"
+	"github.com/dapr/dapr/pkg/sentry/server/ca"
+	"github.com/dapr/dapr/pkg/sentry/server/validator"
+	validatorInsecure "github.com/dapr/dapr/pkg/sentry/server/validator/insecure"
+	validatorJWKS "github.com/dapr/dapr/pkg/sentry/server/validator/jwks"
+	validatorKube "github.com/dapr/dapr/pkg/sentry/server/validator/kubernetes"
+	"github.com/dapr/dapr/utils"
+	"github.com/dapr/kit/concurrency"
 	"github.com/dapr/kit/logger"
-	"github.com/pkg/errors"
 )
 
 var log = logger.NewLogger("dapr.sentry")
 
+type Options struct {
+	Config  config.Config
+	Healthz healthz.Healthz
+}
+
+// CertificateAuthority is the interface for the Sentry Certificate Authority.
+// Starts the Sentry gRPC server and signs workload certificates.
 type CertificateAuthority interface {
-	Run(context.Context, config.SentryConfig, chan bool)
-	Restart(ctx context.Context, conf config.SentryConfig)
+	Start(context.Context) error
 }
 
 type sentry struct {
-	server    server.CAServer
-	reloading bool
+	runners *concurrency.RunnerManager
+	running atomic.Bool
 }
 
-// NewSentryCA returns a new Sentry Certificate Authority instance.
-func NewSentryCA() CertificateAuthority {
-	return &sentry{}
-}
-
-// Run loads the trust anchors and issuer certs, creates a new CA and runs the CA server.
-func (s *sentry) Run(ctx context.Context, conf config.SentryConfig, readyCh chan bool) {
-	// Create CA
-	certAuth, err := ca.NewCertificateAuthority(conf)
+// New returns a new Sentry Certificate Authority instance.
+func New(ctx context.Context, opts Options) (CertificateAuthority, error) {
+	vals, err := buildValidators(opts)
 	if err != nil {
-		log.Fatalf("error getting certificate authority: %s", err)
+		return nil, err
 	}
-	log.Info("certificate authority loaded")
 
-	// Load the trust bundle
-	err = certAuth.LoadOrStoreTrustBundle()
+	camngr, err := ca.New(ctx, opts.Config)
 	if err != nil {
-		log.Fatalf("error loading trust root bundle: %s", err)
+		return nil, fmt.Errorf("error creating CA: %w", err)
 	}
-	log.Infof("trust root bundle loaded. issuer cert expiry: %s", certAuth.GetCACertBundle().GetIssuerCertExpiry().String())
-	monitoring.IssuerCertExpiry(certAuth.GetCACertBundle().GetIssuerCertExpiry())
+	log.Info("CA certificate key pair ready")
 
-	// Create identity validator
-	v, err := createValidator()
+	ns := security.CurrentNamespace()
+	sec, err := security.New(ctx, security.Options{
+		ControlPlaneTrustDomain: opts.Config.TrustDomain,
+		ControlPlaneNamespace:   ns,
+		AppID:                   "dapr-sentry",
+		TrustAnchors:            camngr.TrustAnchors(),
+		MTLSEnabled:             true,
+		Healthz:                 opts.Healthz,
+		Mode:                    opts.Config.Mode,
+		// Override the request source to our in memory CA since _we_ are sentry!
+		OverrideCertRequestFn: func(ctx context.Context, csrDER []byte) ([]*x509.Certificate, error) {
+			csr, csrErr := x509.ParseCertificateRequest(csrDER)
+			if csrErr != nil {
+				monitoring.ServerCertIssueFailed("invalid_csr")
+				return nil, csrErr
+			}
+			certs, csrErr := camngr.SignIdentity(ctx, &ca.SignRequest{
+				PublicKey:          csr.PublicKey.(crypto.PublicKey),
+				SignatureAlgorithm: csr.SignatureAlgorithm,
+				TrustDomain:        opts.Config.TrustDomain,
+				Namespace:          ns,
+				AppID:              "dapr-sentry",
+			})
+			if csrErr != nil {
+				monitoring.ServerCertIssueFailed("ca_error")
+				return nil, csrErr
+			}
+			return certs, nil
+		},
+	})
 	if err != nil {
-		log.Fatalf("error creating validator: %s", err)
-	}
-	log.Info("validator created")
-
-	// Run the CA server
-	s.server = server.NewCAServer(certAuth, v)
-
-	go func() {
-		<-ctx.Done()
-		log.Info("sentry certificate authority is shutting down")
-		s.server.Shutdown() // nolint: errcheck
-	}()
-
-	if readyCh != nil {
-		readyCh <- true
-		s.reloading = false
+		return nil, fmt.Errorf("error creating security: %s", err)
 	}
 
-	log.Infof("sentry certificate authority is running, protecting ya'll")
-	err = s.server.Run(conf.Port, certAuth.GetCACertBundle())
-	if err != nil {
-		log.Fatalf("error starting gRPC server: %s", err)
-	}
-}
-
-func createValidator() (identity.Validator, error) {
-	if config.IsKubernetesHosted() {
-		// we're in Kubernetes, create client and init a new serviceaccount token validator
-		kubeClient, err := k8s.GetClient()
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to create kubernetes client")
+	// Start all background processes
+	runners := concurrency.NewRunnerManager(
+		sec.Run,
+		server.New(server.Options{
+			Port:             opts.Config.Port,
+			Security:         sec,
+			Validators:       vals,
+			DefaultValidator: opts.Config.DefaultValidator,
+			CA:               camngr,
+			Healthz:          opts.Healthz,
+			ListenAddress:    opts.Config.ListenAddress,
+		}).Start,
+	)
+	for name, val := range vals {
+		log.Infof("Using validator '%s'", strings.ToLower(name.String()))
+		if err := runners.Add(val.Start); err != nil {
+			return nil, err
 		}
-		return kubernetes.NewValidator(kubeClient), nil
 	}
-	return selfhosted.NewValidator(), nil
+
+	return &sentry{
+		runners: runners,
+	}, nil
 }
 
-func (s *sentry) Restart(ctx context.Context, conf config.SentryConfig) {
-	if s.reloading {
-		return
+// Start the server.
+func (s *sentry) Start(ctx context.Context) error {
+	// If the server is already running, return an error
+	if !s.running.CompareAndSwap(false, true) {
+		return errors.New("CertificateAuthority server is already running")
 	}
-	s.reloading = true
 
-	s.server.Shutdown()
-	go s.Run(ctx, conf, nil)
+	if err := s.runners.Run(ctx); err != nil {
+		return fmt.Errorf("error running Sentry: %v", err)
+	}
+
+	return nil
+}
+
+func buildValidators(opts Options) (map[sentryv1pb.SignCertificateRequest_TokenValidator]validator.Validator, error) {
+	validators := make(map[sentryv1pb.SignCertificateRequest_TokenValidator]validator.Validator, len(opts.Config.Validators))
+
+	for validatorID, val := range opts.Config.Validators {
+		switch validatorID {
+		case sentryv1pb.SignCertificateRequest_KUBERNETES:
+			td, err := spiffeid.TrustDomainFromString(opts.Config.TrustDomain)
+			if err != nil {
+				return nil, err
+			}
+			sentryID, err := security.SentryID(td, security.CurrentNamespace())
+			if err != nil {
+				return nil, err
+			}
+			val, err := validatorKube.New(validatorKube.Options{
+				RestConfig:     utils.GetConfig(),
+				SentryID:       sentryID,
+				ControlPlaneNS: security.CurrentNamespace(),
+				Healthz:        opts.Healthz,
+			})
+			if err != nil {
+				return nil, err
+			}
+			log.Info("Adding validator 'kubernetes' with Sentry ID: " + sentryID.String())
+			validators[validatorID] = val
+
+		case sentryv1pb.SignCertificateRequest_INSECURE:
+			log.Info("Adding validator 'insecure'")
+			validators[validatorID] = validatorInsecure.New()
+
+		case sentryv1pb.SignCertificateRequest_JWKS:
+			td, err := spiffeid.TrustDomainFromString(opts.Config.TrustDomain)
+			if err != nil {
+				return nil, err
+			}
+			sentryID, err := security.SentryID(td, security.CurrentNamespace())
+			if err != nil {
+				return nil, err
+			}
+			obj := validatorJWKS.Options{
+				SentryID: sentryID,
+				Healthz:  opts.Healthz,
+			}
+			err = decodeOptions(&obj, val)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decode validator options: %w", err)
+			}
+			val, err := validatorJWKS.New(obj)
+			if err != nil {
+				return nil, err
+			}
+			log.Info("Adding validator 'jwks' with Sentry ID: " + sentryID.String())
+			validators[validatorID] = val
+		}
+	}
+
+	if len(validators) == 0 {
+		// Should never hit this, as the config is already sanitized
+		return nil, errors.New("invalid validators")
+	}
+
+	return validators, nil
 }
